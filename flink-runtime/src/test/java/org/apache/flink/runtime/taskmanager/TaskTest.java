@@ -93,6 +93,7 @@ import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -832,6 +833,36 @@ public class TaskTest extends TestLogger {
 			cancelLatch.trigger();
 			task.getExecutingThread().interrupt();
 			task.getExecutingThread().join();
+		}
+	}
+
+	/**
+	 * Tests that a fatal error gotten from canceling task is notified.
+	 */
+	@Test
+	public void testFatalErrorOnCanceling() throws Exception {
+		Task task = spy(createTask(InvokableWithCancelTaskExceptionInInvoke.class, new Configuration()));
+		doThrow(OutOfMemoryError.class).when(task).cancelOrFailAndCancelInvokableInternal(eq(ExecutionState.CANCELING), eq(null));
+
+		try {
+			task.startTaskThread();
+
+			awaitLatch.await();
+
+			task.cancelExecution();
+
+			// Without shortening cancellation timeout, fatal error is expected to be notified by cancelExecution itself
+			// within a few RPC messages (including normal task state transition).
+			for (int i = 0; i < 10; i++) {
+				Object msg = taskManagerMessages.poll(1, TimeUnit.SECONDS);
+				if (msg instanceof TaskManagerMessages.FatalError) {
+					return; // success
+				}
+			}
+
+			fail("Did not receive expected task manager message");
+		} finally {
+			triggerLatch.trigger();
 		}
 	}
 
