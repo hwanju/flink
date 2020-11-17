@@ -53,6 +53,7 @@ import org.apache.flink.runtime.metrics.util.MetricUtils;
 import org.apache.flink.runtime.rpc.FatalErrorHandler;
 import org.apache.flink.runtime.rpc.RpcService;
 import org.apache.flink.runtime.rpc.akka.AkkaRpcServiceUtils;
+import org.apache.flink.runtime.security.FlinkUserSecurityManager;
 import org.apache.flink.runtime.security.SecurityConfiguration;
 import org.apache.flink.runtime.security.SecurityUtils;
 import org.apache.flink.runtime.taskmanager.MemoryLogger;
@@ -486,6 +487,7 @@ public class TaskManagerRunner implements FatalErrorHandler, AutoCloseableAsync 
                         configuration, taskExecutorResourceSpec, externalAddress);
 
         String metricQueryServiceAddress = metricRegistry.getMetricQueryServiceGatewayRpcAddress();
+        FlinkUserSecurityManager.setFromConfiguration(configuration);
 
         return new TaskExecutor(
                 rpcService,

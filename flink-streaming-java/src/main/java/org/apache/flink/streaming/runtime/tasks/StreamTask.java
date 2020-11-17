@@ -49,6 +49,7 @@ import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
 import org.apache.flink.runtime.metrics.groups.OperatorMetricGroup;
 import org.apache.flink.runtime.operators.coordination.OperatorEvent;
 import org.apache.flink.runtime.plugable.SerializationDelegate;
+import org.apache.flink.runtime.security.FlinkUserSecurityManager;
 import org.apache.flink.runtime.state.CheckpointStorageWorkerView;
 import org.apache.flink.runtime.state.StateBackend;
 import org.apache.flink.runtime.state.StateBackendLoader;
@@ -155,7 +156,19 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
     protected static final Logger LOG = LoggerFactory.getLogger(StreamTask.class);
 
     // ------------------------------------------------------------------------
+    /** The configuration of this streaming task. */
+    protected final StreamConfig configuration;
+    /** Our state backend. We use this to create checkpoint streams and a keyed state backend. */
+    protected final StateBackend stateBackend;
+    /**
+     * The internal {@link TimerService} used to define the current processing time (default =
+     * {@code System.currentTimeMillis()}) and register timers for tasks to be executed in the
+     * future.
+     */
+    protected final TimerService timerService;
 
+    protected final MailboxProcessor mailboxProcessor;
+    final MailboxExecutor mainMailboxExecutor;
     /**
      * All actions outside of the task {@link #mailboxProcessor mailbox} (i.e. performed by another
      * thread) must be executed through this executor to ensure that we don't have concurrent method
@@ -167,44 +180,30 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
      */
     private final StreamTaskActionExecutor actionExecutor;
 
-    /** The input processor. Initialized in {@link #init()} method. */
-    @Nullable protected StreamInputProcessor inputProcessor;
-
-    /** the main operator that consumes the input streams of this task. */
-    protected OP mainOperator;
-
-    /** The chain of operators executed by this task. */
-    protected OperatorChain<OUT, OP> operatorChain;
-
-    /** The configuration of this streaming task. */
-    protected final StreamConfig configuration;
-
-    /** Our state backend. We use this to create checkpoint streams and a keyed state backend. */
-    protected final StateBackend stateBackend;
-
     private final SubtaskCheckpointCoordinator subtaskCheckpointCoordinator;
-
-    /**
-     * The internal {@link TimerService} used to define the current processing time (default =
-     * {@code System.currentTimeMillis()}) and register timers for tasks to be executed in the
-     * future.
-     */
-    protected final TimerService timerService;
-
     /** The currently active background materialization threads. */
     private final CloseableRegistry cancelables = new CloseableRegistry();
 
     private final StreamTaskAsyncExceptionHandler asyncExceptionHandler;
+    /** Thread pool for async snapshot workers. */
+    private final ExecutorService asyncOperationsThreadPool;
 
+    private final RecordWriterDelegate<SerializationDelegate<StreamRecord<OUT>>> recordWriter;
+    /** TODO it might be replaced by the global IO executor on TaskManager level future. */
+    private final ExecutorService channelIOExecutor;
+    /** The input processor. Initialized in {@link #init()} method. */
+    @Nullable protected StreamInputProcessor inputProcessor;
+    /** the main operator that consumes the input streams of this task. */
+    protected OP mainOperator;
+    /** The chain of operators executed by this task. */
+    protected OperatorChain<OUT, OP> operatorChain;
     /**
      * Flag to mark the task "in operation", in which case check needs to be initialized to true, so
      * that early cancel() before invoke() behaves correctly.
      */
     private volatile boolean isRunning;
-
     /** Flag to mark this task as canceled. */
     private volatile boolean canceled;
-
     /**
      * Flag to mark this task as failing, i.e. if an exception has occurred inside {@link
      * #invoke()}.
@@ -212,19 +211,6 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
     private volatile boolean failing;
 
     private boolean disposedOperators;
-
-    /** Thread pool for async snapshot workers. */
-    private final ExecutorService asyncOperationsThreadPool;
-
-    private final RecordWriterDelegate<SerializationDelegate<StreamRecord<OUT>>> recordWriter;
-
-    protected final MailboxProcessor mailboxProcessor;
-
-    final MailboxExecutor mainMailboxExecutor;
-
-    /** TODO it might be replaced by the global IO executor on TaskManager level future. */
-    private final ExecutorService channelIOExecutor;
-
     private Long syncSavepointId = null;
 
     private long latestAsyncCheckpointStartDelayNanos;
@@ -343,6 +329,95 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
         injectChannelStateWriterIntoChannels();
     }
 
+    @VisibleForTesting
+    public static <OUT>
+            RecordWriterDelegate<SerializationDelegate<StreamRecord<OUT>>>
+                    createRecordWriterDelegate(
+                            StreamConfig configuration, Environment environment) {
+        List<RecordWriter<SerializationDelegate<StreamRecord<OUT>>>> recordWrites =
+                createRecordWriters(configuration, environment);
+        if (recordWrites.size() == 1) {
+            return new SingleRecordWriter<>(recordWrites.get(0));
+        } else if (recordWrites.size() == 0) {
+            return new NonRecordWriter<>();
+        } else {
+            return new MultipleRecordWriters<>(recordWrites);
+        }
+    }
+
+    private static <OUT>
+            List<RecordWriter<SerializationDelegate<StreamRecord<OUT>>>> createRecordWriters(
+                    StreamConfig configuration, Environment environment) {
+        List<RecordWriter<SerializationDelegate<StreamRecord<OUT>>>> recordWriters =
+                new ArrayList<>();
+        List<StreamEdge> outEdgesInOrder =
+                configuration.getOutEdgesInOrder(
+                        environment.getUserCodeClassLoader().asClassLoader());
+
+        for (int i = 0; i < outEdgesInOrder.size(); i++) {
+            StreamEdge edge = outEdgesInOrder.get(i);
+            recordWriters.add(
+                    createRecordWriter(
+                            edge,
+                            i,
+                            environment,
+                            environment.getTaskInfo().getTaskName(),
+                            edge.getBufferTimeout()));
+        }
+        return recordWriters;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <OUT> RecordWriter<SerializationDelegate<StreamRecord<OUT>>> createRecordWriter(
+            StreamEdge edge,
+            int outputIndex,
+            Environment environment,
+            String taskName,
+            long bufferTimeout) {
+
+        StreamPartitioner<OUT> outputPartitioner = null;
+
+        // Clones the partition to avoid multiple stream edges sharing the same stream partitioner,
+        // like the case of https://issues.apache.org/jira/browse/FLINK-14087.
+        try {
+            outputPartitioner =
+                    InstantiationUtil.clone(
+                            (StreamPartitioner<OUT>) edge.getPartitioner(),
+                            environment.getUserCodeClassLoader().asClassLoader());
+        } catch (Exception e) {
+            ExceptionUtils.rethrow(e);
+        }
+
+        LOG.debug(
+                "Using partitioner {} for output {} of task {}",
+                outputPartitioner,
+                outputIndex,
+                taskName);
+
+        ResultPartitionWriter bufferWriter = environment.getWriter(outputIndex);
+
+        // we initialize the partitioner here with the number of key groups (aka max. parallelism)
+        if (outputPartitioner instanceof ConfigurableStreamPartitioner) {
+            int numKeyGroups = bufferWriter.getNumTargetKeyGroups();
+            if (0 < numKeyGroups) {
+                ((ConfigurableStreamPartitioner) outputPartitioner).configure(numKeyGroups);
+            }
+        }
+
+        RecordWriter<SerializationDelegate<StreamRecord<OUT>>> output =
+                new RecordWriterBuilder<SerializationDelegate<StreamRecord<OUT>>>()
+                        .setChannelSelector(outputPartitioner)
+                        .setTimeout(bufferTimeout)
+                        .setTaskName(taskName)
+                        .build(bufferWriter);
+        output.setMetricGroup(environment.getMetricGroup().getIOMetricGroup());
+        return output;
+    }
+
+    // ------------------------------------------------------------------------
+    //  Life cycle methods for specific implementations
+    // ------------------------------------------------------------------------
+
     private void injectChannelStateWriterIntoChannels() {
         final Environment env = getEnvironment();
         final ChannelStateWriter channelStateWriter =
@@ -368,10 +443,6 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
     SubtaskCheckpointCoordinator getCheckpointCoordinator() {
         return subtaskCheckpointCoordinator;
     }
-
-    // ------------------------------------------------------------------------
-    //  Life cycle methods for specific implementations
-    // ------------------------------------------------------------------------
 
     protected abstract void init() throws Exception;
 
@@ -425,6 +496,11 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
         syncSavepointId = null;
     }
 
+    @VisibleForTesting
+    OptionalLong getSynchronousSavepointId() {
+        return syncSavepointId != null ? OptionalLong.of(syncSavepointId) : OptionalLong.empty();
+    }
+
     private void setSynchronousSavepointId(long checkpointId) {
         Preconditions.checkState(
                 syncSavepointId == null,
@@ -432,14 +508,13 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
         syncSavepointId = checkpointId;
     }
 
-    @VisibleForTesting
-    OptionalLong getSynchronousSavepointId() {
-        return syncSavepointId != null ? OptionalLong.of(syncSavepointId) : OptionalLong.empty();
-    }
-
     private boolean isSynchronousSavepointId(long checkpointId) {
         return syncSavepointId != null && syncSavepointId == checkpointId;
     }
+
+    // ------------------------------------------------------------------------
+    //  Core work methods of the Stream Task
+    // ------------------------------------------------------------------------
 
     private void runSynchronousSavepointMailboxLoop() throws Exception {
         assert syncSavepointId != null;
@@ -474,10 +549,6 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
      * <p>For tasks other than the source task, this method does nothing.
      */
     protected void finishTask() throws Exception {}
-
-    // ------------------------------------------------------------------------
-    //  Core work methods of the Stream Task
-    // ------------------------------------------------------------------------
 
     public StreamTaskStateInitializer createStreamTaskStateInitializer() {
         InternalTimeServiceManager.Provider timerServiceProvider =
@@ -561,38 +632,50 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
 
     @Override
     public final void invoke() throws Exception {
+        // Monitor user codes from exiting JVM. This can be done in a finer-grained way like
+        // enclosing user callback
+        // functions individually (open, close, invoke, run, cancel, etc), but as Flink-managed exit
+        // is not performed
+        // and expected in this invoke function anyhow, we can monitor exiting JVM for entire scope.
+        // Cancel and
+        // checkpoint are handled in their own methods.
+        FlinkUserSecurityManager.monitorSystemExitForCurrentThread();
         try {
-            beforeInvoke();
-
-            // final check to exit early before starting to run
-            if (canceled) {
-                throw new CancelTaskException();
-            }
-
-            // let the task do its work
-            runMailboxLoop();
-
-            // if this left the run() method cleanly despite the fact that this was canceled,
-            // make sure the "clean shutdown" is not attempted
-            if (canceled) {
-                throw new CancelTaskException();
-            }
-
-            afterInvoke();
-        } catch (Throwable invokeException) {
-            failing = !canceled;
             try {
-                cleanUpInvoke();
+                beforeInvoke();
+
+                // final check to exit early before starting to run
+                if (canceled) {
+                    throw new CancelTaskException();
+                }
+
+                // let the task do its work
+                runMailboxLoop();
+
+                // if this left the run() method cleanly despite the fact that this was canceled,
+                // make sure the "clean shutdown" is not attempted
+                if (canceled) {
+                    throw new CancelTaskException();
+                }
+
+                afterInvoke();
+            } catch (Throwable invokeException) {
+                failing = !canceled;
+                try {
+                    cleanUpInvoke();
+                }
+                // TODO: investigate why Throwable instead of Exception is used here.
+                catch (Throwable cleanUpException) {
+                    Throwable throwable =
+                            ExceptionUtils.firstOrSuppressed(cleanUpException, invokeException);
+                    ExceptionUtils.rethrowException(throwable);
+                }
+                ExceptionUtils.rethrowException(invokeException);
             }
-            // TODO: investigate why Throwable instead of Exception is used here.
-            catch (Throwable cleanUpException) {
-                Throwable throwable =
-                        ExceptionUtils.firstOrSuppressed(cleanUpException, invokeException);
-                ExceptionUtils.rethrowException(throwable);
-            }
-            ExceptionUtils.rethrowException(invokeException);
+            cleanUpInvoke();
+        } finally {
+            FlinkUserSecurityManager.unmonitorSystemExitForCurrentThread();
         }
-        cleanUpInvoke();
     }
 
     @VisibleForTesting
@@ -705,9 +788,11 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
 
         // the "cancel task" call must come first, but the cancelables must be
         // closed no matter what
+        FlinkUserSecurityManager.monitorSystemExitForCurrentThread();
         try {
             cancelTask();
         } finally {
+            FlinkUserSecurityManager.unmonitorSystemExitForCurrentThread();
             getCompletionFuture()
                     .whenComplete(
                             (unusedResult, unusedError) -> {
@@ -769,6 +854,10 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
         return originalException;
     }
 
+    // ------------------------------------------------------------------------
+    //  Access to properties and utilities
+    // ------------------------------------------------------------------------
+
     /**
      * Execute @link StreamOperator#dispose()} of each operator in the chain of this {@link
      * StreamTask}. Disposing happens from <b>tail to head</b> operator in the chain.
@@ -815,10 +904,6 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
         return tc == TimeCharacteristic.EventTime | tc == TimeCharacteristic.IngestionTime;
     }
 
-    // ------------------------------------------------------------------------
-    //  Access to properties and utilities
-    // ------------------------------------------------------------------------
-
     /**
      * Gets the name of the task, in the form "taskname (2/5)".
      *
@@ -844,6 +929,10 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
         return subtaskCheckpointCoordinator.getCheckpointStorage();
     }
 
+    // ------------------------------------------------------------------------
+    //  Checkpoint and Restore
+    // ------------------------------------------------------------------------
+
     public StreamConfig getConfiguration() {
         return configuration;
     }
@@ -855,10 +944,6 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
     RecordWriterOutput<?>[] getStreamOutputs() {
         return operatorChain.getStreamOutputs();
     }
-
-    // ------------------------------------------------------------------------
-    //  Checkpoint and Restore
-    // ------------------------------------------------------------------------
 
     @Override
     public Future<Boolean> triggerCheckpointAsync(
@@ -898,6 +983,7 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
             CheckpointOptions checkpointOptions,
             boolean advanceToEndOfEventTime)
             throws Exception {
+        FlinkUserSecurityManager.monitorSystemExitForCurrentThread();
         try {
             // No alignment if we inject a checkpoint
             CheckpointMetricsBuilder checkpointMetrics =
@@ -937,6 +1023,8 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
                         e);
                 return false;
             }
+        } finally {
+            FlinkUserSecurityManager.unmonitorSystemExitForCurrentThread();
         }
     }
 
@@ -947,6 +1035,7 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
             CheckpointMetricsBuilder checkpointMetrics)
             throws IOException {
 
+        FlinkUserSecurityManager.monitorSystemExitForCurrentThread();
         try {
             if (performCheckpoint(
                     checkpointMetaData, checkpointOptions, checkpointMetrics, false)) {
@@ -968,6 +1057,8 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
                             + getName()
                             + '.',
                     e);
+        } finally {
+            FlinkUserSecurityManager.unmonitorSystemExitForCurrentThread();
         }
     }
 
@@ -1057,6 +1148,10 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
                 String.format("checkpoint %d aborted", checkpointId));
     }
 
+    // ------------------------------------------------------------------------
+    //  Operator Events
+    // ------------------------------------------------------------------------
+
     private Future<Void> notifyCheckpointOperation(
             RunnableWithException runnable, String description) {
         CompletableFuture<Void> result = new CompletableFuture<>();
@@ -1075,6 +1170,10 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
                         description);
         return result;
     }
+
+    // ------------------------------------------------------------------------
+    //  State backend
+    // ------------------------------------------------------------------------
 
     private void notifyCheckpointComplete(long checkpointId) throws Exception {
         subtaskCheckpointCoordinator.notifyCheckpointComplete(
@@ -1102,10 +1201,6 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
         }
     }
 
-    // ------------------------------------------------------------------------
-    //  Operator Events
-    // ------------------------------------------------------------------------
-
     @Override
     public void dispatchOperatorEvent(OperatorID operator, SerializedValue<OperatorEvent> event)
             throws FlinkException {
@@ -1117,10 +1212,6 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
             // this happens during shutdown, we can swallow this
         }
     }
-
-    // ------------------------------------------------------------------------
-    //  State backend
-    // ------------------------------------------------------------------------
 
     private StateBackend createStateBackend() throws Exception {
         final StateBackend fromApplication =
@@ -1147,10 +1238,16 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
         return this.mainOperator;
     }
 
+    // ------------------------------------------------------------------------
+    //  Utilities
+    // ------------------------------------------------------------------------
+
     @VisibleForTesting
     StreamTaskActionExecutor getActionExecutor() {
         return actionExecutor;
     }
+
+    // ------------------------------------------------------------------------
 
     public ProcessingTimeServiceFactory getProcessingTimeServiceFactory() {
         return mailboxExecutor ->
@@ -1180,118 +1277,14 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
     }
 
     // ------------------------------------------------------------------------
-    //  Utilities
-    // ------------------------------------------------------------------------
 
     @Override
     public String toString() {
         return getName();
     }
 
-    // ------------------------------------------------------------------------
-
-    /** Utility class to encapsulate the handling of asynchronous exceptions. */
-    static class StreamTaskAsyncExceptionHandler {
-        private final Environment environment;
-
-        StreamTaskAsyncExceptionHandler(Environment environment) {
-            this.environment = environment;
-        }
-
-        void handleAsyncException(String message, Throwable exception) {
-            environment.failExternally(new AsynchronousException(message, exception));
-        }
-    }
-
     public final CloseableRegistry getCancelables() {
         return cancelables;
-    }
-
-    // ------------------------------------------------------------------------
-
-    @VisibleForTesting
-    public static <OUT>
-            RecordWriterDelegate<SerializationDelegate<StreamRecord<OUT>>>
-                    createRecordWriterDelegate(
-                            StreamConfig configuration, Environment environment) {
-        List<RecordWriter<SerializationDelegate<StreamRecord<OUT>>>> recordWrites =
-                createRecordWriters(configuration, environment);
-        if (recordWrites.size() == 1) {
-            return new SingleRecordWriter<>(recordWrites.get(0));
-        } else if (recordWrites.size() == 0) {
-            return new NonRecordWriter<>();
-        } else {
-            return new MultipleRecordWriters<>(recordWrites);
-        }
-    }
-
-    private static <OUT>
-            List<RecordWriter<SerializationDelegate<StreamRecord<OUT>>>> createRecordWriters(
-                    StreamConfig configuration, Environment environment) {
-        List<RecordWriter<SerializationDelegate<StreamRecord<OUT>>>> recordWriters =
-                new ArrayList<>();
-        List<StreamEdge> outEdgesInOrder =
-                configuration.getOutEdgesInOrder(
-                        environment.getUserCodeClassLoader().asClassLoader());
-
-        for (int i = 0; i < outEdgesInOrder.size(); i++) {
-            StreamEdge edge = outEdgesInOrder.get(i);
-            recordWriters.add(
-                    createRecordWriter(
-                            edge,
-                            i,
-                            environment,
-                            environment.getTaskInfo().getTaskName(),
-                            edge.getBufferTimeout()));
-        }
-        return recordWriters;
-    }
-
-    @SuppressWarnings("unchecked")
-    private static <OUT> RecordWriter<SerializationDelegate<StreamRecord<OUT>>> createRecordWriter(
-            StreamEdge edge,
-            int outputIndex,
-            Environment environment,
-            String taskName,
-            long bufferTimeout) {
-
-        StreamPartitioner<OUT> outputPartitioner = null;
-
-        // Clones the partition to avoid multiple stream edges sharing the same stream partitioner,
-        // like the case of https://issues.apache.org/jira/browse/FLINK-14087.
-        try {
-            outputPartitioner =
-                    InstantiationUtil.clone(
-                            (StreamPartitioner<OUT>) edge.getPartitioner(),
-                            environment.getUserCodeClassLoader().asClassLoader());
-        } catch (Exception e) {
-            ExceptionUtils.rethrow(e);
-        }
-
-        LOG.debug(
-                "Using partitioner {} for output {} of task {}",
-                outputPartitioner,
-                outputIndex,
-                taskName);
-
-        ResultPartitionWriter bufferWriter = environment.getWriter(outputIndex);
-
-        // we initialize the partitioner here with the number of key groups (aka max. parallelism)
-        if (outputPartitioner instanceof ConfigurableStreamPartitioner) {
-            int numKeyGroups = bufferWriter.getNumTargetKeyGroups();
-            if (0 < numKeyGroups) {
-                ((ConfigurableStreamPartitioner) outputPartitioner).configure(numKeyGroups);
-            }
-        }
-
-        RecordWriter<SerializationDelegate<StreamRecord<OUT>>> output =
-                new RecordWriterBuilder<SerializationDelegate<StreamRecord<OUT>>>()
-                        .setChannelSelector(outputPartitioner)
-                        .setTimeout(bufferTimeout)
-                        .setTaskName(taskName)
-                        .build(bufferWriter);
-        output.setMetricGroup(environment.getMetricGroup().getIOMetricGroup());
-        return output;
     }
 
     private void handleTimerException(Exception ex) {
@@ -1320,5 +1313,18 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
 
     protected long getAsyncCheckpointStartDelayNanos() {
         return latestAsyncCheckpointStartDelayNanos;
+    }
+
+    /** Utility class to encapsulate the handling of asynchronous exceptions. */
+    static class StreamTaskAsyncExceptionHandler {
+        private final Environment environment;
+
+        StreamTaskAsyncExceptionHandler(Environment environment) {
+            this.environment = environment;
+        }
+
+        void handleAsyncException(String message, Throwable exception) {
+            environment.failExternally(new AsynchronousException(message, exception));
+        }
     }
 }
